@@ -1,0 +1,6 @@
+# 개인 환경 전용 override (org/라벨/주기 등) — 커밋 금지
+config.sh
+
+# macOS / 런타임 부산물
+.DS_Store
+*.err
