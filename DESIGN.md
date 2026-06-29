@@ -1,150 +1,112 @@
 # 설계 노트 / 상세 문서
 
-README에서 다루기엔 긴 배경·근거·재현 절차를 모았다. 일상 사용은 [README](./README.md),
-배포 모델/개발 규칙은 [CLAUDE.md](./CLAUDE.md) 참고.
+ReviewBar의 아키텍처·근거·의사결정을 모았다. 일상 사용은 [README](./README.md), 개발 규칙·디버깅 함정은
+[CLAUDE.md](./CLAUDE.md) 참고.
 
 ---
 
-## 대상 검색식
+## 아키텍처
 
-플러그인이 `gh api search/issues` 에 raw `q` 로 넘기는 검색식:
+**메뉴바 팝오버(`MenuBarExtra(.window)`) + 백그라운드 비동기 폴링.**
 
-```
-org:$ORG is:pr is:open review-requested:@me        # (+ jq에서 LABEL_PREFIX prefix 필터)
-```
+- `ReviewBarApp`(`@main`)이 `MenuBarExtra { ContentView } label: { GitHub 마크 + 배지 }`를 `.menuBarExtraStyle(.window)`로 띄운다.
+- `AppModel`(`@MainActor @Observable`)이 상태(4분류 PR 배열·로딩·에러·마지막 갱신)를 들고, `start()`가
+  `while` 루프로 `Config.refreshInterval`(기본 300초)마다 `refresh()`를 돈다.
+- `start()`는 **`App.init`에서** 호출한다. `MenuBarExtra(.window)`의 `ContentView`는 팝오버를 처음 열 때만
+  생성되므로, `.task`에 두면 메뉴를 한 번도 안 열면 폴링·알림이 시작되지 않는다.
+- 팝오버를 새로 열 때도 즉시 갱신한다: `WindowAccessor`가 팝오버 `NSWindow`를 잡아
+  `NSWindow.didBecomeKeyNotification`을 관찰 → `refresh(notify: false)`.
 
-- 드롭다운의 **"검색 결과 열기"** 항목은 이 검색식을 그대로 인코딩한
-  `https://github.com/search?q=…&type=pullrequests` URL을 **런타임에 생성**해 연다(개인 저장 View ID 같은 식별자 없음).
-- `gh search prs` 에 검색식을 통째로 위치인자로 넘기면 gh가 전체를 한 토큰으로 quoting해 깨진다.
-  그래서 `gh api … --raw-field q=…` 를 쓴다. 이 방식은 `-review:approved` 같은 **부정 qualifier까지 정상 동작**한다.
+### 왜 네이티브 앱인가 (자동 닫힘 버그)
+
+SwiftBar 플러그인 시절의 근본 문제는 **macOS `NSMenu`가 열린 채로 내용 교체가 불가**하다는 것이었다
+(백그라운드 fetch 후 갱신하면 재렌더 = 메뉴 닫힘). SwiftBar에선 동기 fetch로 우회했지만 열 때마다 1.5~2초 대기가 따랐다.
+
+`MenuBarExtra(.window)`는 `NSMenu`가 아니라 팝오버(NSPopover류)에 임의 SwiftUI 뷰를 띄운다. 상태 변경 시
+SwiftUI가 부분 갱신할 뿐 닫히지 않는다 → **백그라운드 폴링 중에도 팝오버가 열린 채 유지**된다. 동기 대기도 사라졌다.
 
 ---
 
-## 동작 방식 (아키텍처)
+## 데이터: GraphQL 단일 요청
 
-**동기(synchronous) 방식.** 핵심은 "메뉴를 여는 동안 fetch가 렌더보다 먼저 끝난다"는 것.
+`gh auth token`으로 받은 토큰을 `URLSession` POST(`https://api.github.com/graphql`)에 실어, alias 2개를 **한 요청**으로 가져온다:
 
-- **메뉴 열 때**: `swiftbar.refreshOnOpen=true` → SwiftBar가 스크립트를 실행 → 스크립트는 `gh` 를 **동기 호출**(약 1.5~2초)하고 최신 결과를 출력 → SwiftBar가 그 출력으로 메뉴를 띄움.
-  fetch가 **렌더 전에** 끝나므로 메뉴는 이미 최신 상태로 뜨고, 이후 재렌더가 없어 **저절로 닫히지 않는다**. (대가: 열 때 ~1.5~2초 대기)
-- **메뉴 닫혀 있을 때**: 파일명 주기(`5m`)로 SwiftBar가 백그라운드 실행 → 배지(개수)만 최신 유지.
-- **비동기 백그라운드 fetch / `refreshallplugins` 미사용.**
+```graphql
+query {
+  reviewRequested: search(query: "org:… is:pr is:open review-requested:@me", type: ISSUE, first: N) {
+    nodes { ... on PullRequest { number title url reviewDecision createdAt
+                                 author{login avatarUrl} repository{nameWithOwner} labels(first:10){nodes{name color}} } }
+  }
+  authored: search(query: "is:pr is:open author:@me", type: ISSUE, first: N) { nodes { …동일… } }
+}
+```
 
-### 승인/미승인 분리
+- **분류는 `reviewDecision` 기준**: `APPROVED` → 승인/리뷰 완료, 그 외(`REVIEW_REQUIRED`/`CHANGES_REQUESTED`/null) → 미승인/리뷰 전.
+- 검색식은 `Config.reviewBase`(org 한정) / `Config.mineBase`(org 한정 없음)를 재사용한다.
+- **하단 "검색 결과 열기" 버튼**은 같은 검색식을 `https://github.com/search?q=…&type=pullrequests` URL로 런타임 생성해 연다(저장된 View ID 같은 식별자 없음).
 
-REST `search/issues` 응답엔 리뷰 상태 필드가 없다. GraphQL `search`로 `reviewDecision`을 받을 수 있지만
-리졸버가 느려 ~2.5s(REST의 2배). 대신 검색의 `review:approved` 한정자로 두 쿼리를 **병렬 REST**로 날린다:
+> **SwiftBar(REST 4회) → 앱(GraphQL 1회)로 바꾼 이유**: REST `search/issues` 응답엔 리뷰 상태 필드가 없어
+> `review:approved`/`-review:approved`로 쿼리를 4개로 쪼개야 했다. GraphQL은 `reviewDecision`을 직접 주므로 1요청으로
+> 분류까지 끝난다(실측 ~1.8s). 백그라운드 폴링이라 약간의 지연은 UX에 영향 없다.
 
-- ✅ 승인됨: 베이스 + `review:approved`
-- ⏳ 미승인: 베이스 + `-review:approved`
+### 라벨 prefix 필터는 클라이언트에서
 
-둘은 같은 베이스의 정확한 여집합이라 합집합 = 전체(빠짐/중복 없음). 각 ~1.2s가 동시에 끝나 전체 ~1.2s.
-배지 숫자는 **prefix 필터링된 ⏳미승인 건수만**(승인된 건 액션이 끝나 제외), 부제엔 `⏳N ✅M` 둘 다.
+GitHub `label:`은 전체 문자열 정확 일치라 `리뷰요청-프론트` 같은 변형을 못 잡는다. 그래서 서버 쿼리엔 label을 넣지 않고,
+받은 뒤 `Config.labelMatches`가 `labelPrefix`로 **시작하는** 라벨만 통과시킨다(`리뷰요청-*` 포함, `리뷰완료`·무라벨 제외).
+`labelPrefix == ""`이면 필터 끔. **리뷰할 PR에만 적용**하고 내 PR엔 적용하지 않는다(작성자가 항상 나라서).
 
 ### `-reviewed-by:@me` 를 쓰지 않는 이유
 
-GitHub의 "Comment" 리뷰는 review 요청을 해제하지 않는다(Approve/Request changes만 해제).
-따라서 코멘트만 남긴 PR도 여전히 `review-requested:@me` 로 남는다. `-reviewed-by:@me` 를 쓰면 그런 코멘트
-PR까지 걸러내 "approve 안 했는데 사라지는" 문제가 있어서 **빼고**, approve(또는 request changes) 전까지 그대로 노출한다.
-approve하면 GitHub가 요청에서 빼주므로 자동으로 사라진다.
-
-### 라벨은 서버 쿼리가 아니라 jq에서 필터
-
-GitHub `label:`은 전체 문자열 정확 일치라 `리뷰요청-프론트` 같은 변형을 못 잡는다.
-→ 서버 쿼리에선 label을 빼고(전체 review-requested 수집), `jq`에서 `LABEL_PREFIX`로 **시작하는** 라벨만 노출.
-`리뷰요청-*` 변형 자동 포함, `리뷰완료`·무라벨은 제외. `LABEL_PREFIX=""`면 필터 없이 전부.
-
-### 왜 비동기를 안 쓰나 (자동 닫힘 버그)
-
-초기엔 "캐시 즉시 표시 + 백그라운드 fetch 후 `refreshallplugins`로 갱신" 구조였는데,
-**fetch 완료 시점의 `refreshallplugins`가 열려 있던 드롭다운을 재렌더하면서 메뉴를 닫아버렸다.**
-(macOS `NSMenu`는 열린 채로 내용 교체가 불가 → 재렌더 = 닫힘.)
-→ 동기 방식으로 회귀해 근본 제거.
-
-### 남는 한계
-
-- 열 때 ~1.5~2초 대기(동기 호출 비용).
-- 주기 갱신(5분)이 **메뉴 열린 순간과 겹치면** SwiftBar 자체 재렌더로 닫힐 수 있음(강제 `refreshallplugins`는 제거해 빈도·공격성은 크게 낮음). macOS엔 "메뉴 열린 동안 갱신 보류" 훅이 없어 100% 회피는 구조적으로 불가.
+GitHub의 "Comment" 리뷰는 review 요청을 해제하지 않는다(Approve/Request changes만 해제). `-reviewed-by:@me`를 쓰면
+코멘트만 남긴 PR까지 걸러져 "approve 안 했는데 사라지는" 문제가 생긴다 → 빼고, approve(또는 request changes) 전까지 그대로 노출한다.
 
 ---
 
-## 인증 / 권한 (왜 SwiftBar + gh 인가)
+## 새 리뷰 요청 알림
 
-- org에 **OAuth App access 제한**이 켜져 있으면, OAuth 앱은 org owner 승인분만 org 데이터에 접근할 수 있다.
-  - **Raycast** 등 GitHub OAuth 확장은 org 미승인이면 **org PR이 안 보임**.
-  - **gh CLI** 토큰은 org에 이미 승인돼 있으면 org private repo/PR이 보인다. (scope: `repo`, `read:org`)
-  - PAT 기반 도구는 OAuth 제한과 무관.
-- 결론: **SwiftBar + gh** 조합 — 이미 승인된 gh 토큰 재사용 + 임의 검색식 자유.
-- (SAML SSO org면 토큰에 SSO authorize 1회 필요.)
+백그라운드 폴링이 기존 데이터 대비 **새로 들어온 "리뷰할·미승인" PR**(`reviewPending`, 배지와 동일 집합)을 감지하면 데스크톱 알림을 띄운다.
 
----
+- **diff 기준선**: `AppModel`이 직전 폴링의 `reviewPending` id 집합(`knownReviewIDs`)을 기억하고, 새 결과와의 차집합을 알림 대상으로 본다. 기준선은 모든 갱신 경로에서 갱신한다.
+- **백그라운드 폴링에서만 알림**: `refresh(notify:)`의 `notify`가 폴링은 `true`, 메뉴 직접 열기·수동 새로고침은 `false`(이미 보는 중이라 중복 방지).
+- **첫 폴링은 기준선만 잡고 알림 안 함**(`hasBaseline`) → 앱 시작 시 기존 PR이 전부 "새것"으로 잡혀 폭탄 알림 나는 것 방지.
+- **표시**: `Notifier`가 `UserNotifications`로 배너 게시. 1건이면 제목·레포·작성자, 여러 건이면 묶음. 클릭 시 PR URL(여러 건은 검색 페이지)을 `NSWorkspace`로 연다.
+- **fallback**: 번들 ID가 없는 등으로 UN을 못 쓰면 `osascript display notification`으로 표시만 한다(클릭 액션 없음). ad-hoc 서명 + LSUIElement 앱에서도 UN이 정상 동작하므로 실제로는 거의 안 탄다.
 
-## 파일 구성
-
-이 폴더는 **원본(source of truth)** 이다. 실제로 동작하는 파일 위치는 따로 있다.
-
-| 이 폴더 | 실제 동작 위치 | 설명 |
-|---|---|---|
-| `org-review-prs.5m.sh` | `~/.config/swiftbar/org-review-prs.5m.sh` | SwiftBar 플러그인 본체 (파일명 `.5m.` = 5분 주기) |
-| `config.example.sh` | — | 개인 설정 템플릿 (커밋됨) |
-| `config.sh` (선택) | `~/.config/swiftbar/org-review-prs.config.sh` | 개인 override (`.gitignore`, 비커밋) |
-| `assets/github-icon.b64` | `~/.cache/swiftbar/github-icon.b64` | 메뉴바 GitHub 마크 (base64 PNG, 36px@2x) |
-| `assets/pr-icon.b64` | `~/.cache/swiftbar/pr-icon.b64` | 각 PR 행 앞 PR 마크 (base64 PNG, 32px@2x) |
-| `assets/github-mark.png` | — | 메뉴바 아이콘 원본 (240×240 투명 PNG) |
-| `assets/git-pull-request.png` | — | PR 행 아이콘 원본 (240×240 투명 PNG) |
-| `pngprep.swift` | — | PNG → (투명 유지) 리사이즈 @2x 변환 헬퍼 |
-| `install.sh` | — | 위 위치들로 배치하는 재현 스크립트 |
-| `.gitignore` | — | `config.sh`·런타임 부산물 비커밋 |
-
-런타임 부수 파일: `~/.cache/swiftbar/org-review-prs.err` (마지막 gh 에러 로그).
-아이콘 원본은 GitHub Octicons / GitHub 마크 등 공개 아이콘이다.
+> 알림 아이콘은 앱 아이콘을 따르고, 알림 데몬이 별도 캐싱한다. 아이콘 변경 후 반영 함정은 [CLAUDE.md](./CLAUDE.md#-알림-디버깅-함정-겪은-것) 참고.
 
 ---
 
-## 아이콘 재생성
+## UI
 
-SF Symbols에는 GitHub/PR 로고가 없어 **base64 PNG를 `templateImage`로** 쓴다.
-`templateImage`는 **알파(투명도)만** 보고 모양을 만들어 메뉴바/메뉴 색(다크=흰색, 라이트=검정)에 맞춰 틴트된다.
+- **Liquid Glass(macOS 26)**: 대분류 카드 2개(`👀 리뷰할 PR` / `🙋 내 PR`)는 `glassEffect` + `GlassEffectContainer`로 합성.
+  footer 버튼도 `.buttonStyle(.glass)`/`.glassProminent`.
+- **카드 구성**: 카드 헤더(SF Symbol + 제목 + 카운트 pill) 아래 하위 섹션(미승인/승인 · 리뷰 전/완료). PR 행은
+  아바타 + 제목(2줄) + 색 라벨 칩 + 메타(`@작성자 · 레포 #번호 · 상대시간`). 행 hover 하이라이트 + 손가락 커서(`.pointerStyle(.link)`).
+- **동적 높이**: 카드 스택 높이를 `onGeometryChange`로 측정해, 컨텐츠가 작으면 팝오버가 줄고 최대 600pt에서 스크롤한다.
 
-주의(겪은 함정):
-- 배경이 **불투명**한 PNG면 다크 메뉴바에서 **흰 사각형**으로 꽉 찬다 → 반드시 **투명 배경**.
-- 18px를 1x로 넣으면 Retina에서 2배 확대돼 **흐릿** → **2배 해상도 + 144dpi(@2x)** 로 넣어야 선명.
+## 아이콘
 
-`pngprep.swift` 가 위 둘을 처리한다 (AppKit으로 투명 유지 리사이즈 + dpi 메타데이터 기록):
-
-```bash
-# 사용법: swift pngprep.swift <src.png> <dst.png> <pointSize> <scale>
-
-# 메뉴바 GitHub 마크 (18pt @2x = 36px, 144dpi)
-swift pngprep.swift assets/github-mark.png /tmp/gh.png 18 2
-base64 -i /tmp/gh.png | tr -d '\n' > ~/.cache/swiftbar/github-icon.b64
-
-# PR 행 마크 (16pt @2x = 32px, 144dpi)
-swift pngprep.swift assets/git-pull-request.png /tmp/pr.png 16 2
-base64 -i /tmp/pr.png | tr -d '\n' > ~/.cache/swiftbar/pr-icon.b64
-
-open "swiftbar://refreshallplugins"
-```
-
-다른 아이콘으로 바꾸려면 투명 배경 PNG(정사각, 64px+)를 위 명령의 src에 넣으면 된다.
+앱 아이콘 = 메뉴바 알림 아이콘. `icon_gen.swift`가 `Sources/ReviewBar/Resources/github-mark.png`를 베이스로
+AppKit 드로잉(둥근 사각형 다크 그라데이션 + 흰 Octocat + 우하단 초록 체크 배지)해 1024px PNG를 만들고,
+`build.sh`가 `sips`로 iconset → `iconutil`로 `AppIcon.icns`를 생성해 번들에 넣는다(Info.plist `CFBundleIconFile=AppIcon`).
+메뉴바 마크는 `github-mark.png`를 template 이미지로 써서 다크/라이트에 맞춰 틴트된다.
 
 ---
 
-## 추가 커스터마이징
+## 인증 / 권한 (왜 gh 토큰 재사용인가)
 
-- **PR 행 아이콘 제거**: 스크립트의 `PR_ICON_PARAM=""` 로 두면 아이콘 없이 표시.
-- **라벨 레이아웃**: 현재는 "보이는 둘째 줄(회색 단색)"에 `🏷 라벨 · 작성자 · 레포 #번호`.
-  - 라벨별 **색**을 살리려면 한 줄=한 색 제약상 호버 서브메뉴(`--🏷 라벨 | color=#hex`) 방식이어야 함.
-  - 작성자·레포를 빼려면 둘째 줄의 `@\(.user.login) · \($repo) #\(.number)` 부분 제거.
-
-(org / 라벨 / 페이지 수 / 갱신 주기는 [README의 설정](./README.md#설정-configsh) 참고.)
+- org에 **OAuth App access 제한**이 켜져 있으면 OAuth 앱(Raycast 등)은 org 미승인 시 org PR이 안 보인다.
+- `gh` CLI 토큰은 org에 이미 승인돼 있으면 org private repo/PR을 볼 수 있다(scope `repo`, `read:org`).
+- → `gh auth token`을 재사용하면 별도 OAuth 승인 없이 org 데이터 + 임의 검색식 자유를 얻는다.
+- GUI 앱은 PATH가 비어 있어 `Config.ghPath`로 `gh` 경로를 명시한다. (SAML SSO org면 토큰에 SSO authorize 1회 필요.)
 
 ---
 
 ## 의사결정 로그 (요약)
 
-1. **메뉴바에서 org PR 보기** → OAuth 확장(Raycast 등)은 org 미승인으로 막힐 수 있음. gh 토큰은 org 승인돼 있음 → **SwiftBar + gh** 채택.
-2. **검색식 전달** → `gh api search/issues` raw `q` (부정 qualifier OK). "검색 결과 열기"는 쿼리 기반 URL을 런타임 생성.
-3. **자동 닫힘 버그** → 비동기 fetch+`refreshallplugins` 제거, **동기 방식**으로 회귀.
-4. **아이콘** → SF Symbol 없음 → `templateImage`(base64). 투명 배경 필수, @2x로 선명화. `pngprep.swift` 도입.
-5. **라벨 표시** → 보이는 2줄 레이아웃(제목 / 라벨·메타), 구분선으로 PR 묶음 구분.
-6. **공유** → org/라벨은 기본값으로 두고 개인값은 `config.sh`(비커밋)로 분리, Claude 온보딩 절차를 `CLAUDE.md`에 정의.
+1. **메뉴바에서 org PR 보기** → OAuth 확장은 org 미승인으로 막힐 수 있음 → 이미 승인된 **gh 토큰 재사용**.
+2. **자동 닫힘 버그** → `NSMenu` 한계. SwiftBar(동기 fetch 우회)에서 **`MenuBarExtra(.window)` + 백그라운드 async 폴링** 네이티브 앱으로 전환해 근본 제거.
+3. **요청 수 축소** → REST 4회(리뷰 상태 필드 없음)에서 **GraphQL 단일 요청 + `reviewDecision` 분류**로.
+4. **새 리뷰 요청 알림** → 기준선 diff + 백그라운드 폴링에서만 + 첫 폴링 baseline(폭탄 방지) + `UserNotifications`(osascript fallback).
+5. **UI** → Liquid Glass 카드 2개·동적 높이·아바타/라벨 칩/상대시간. 텍스트 줄 나열(SwiftBar)에서 탈피.
+6. **아이콘** → `github-mark.png` 기반 창의적 앱 아이콘(`icon_gen.swift`)을 빌드 시 생성.

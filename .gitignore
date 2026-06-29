@@ -1,6 +1,8 @@
-# 개인 환경 전용 override (org/라벨/주기 등) — 커밋 금지
-config.sh
-
-# macOS / 런타임 부산물
+# macOS
 .DS_Store
-*.err
+
+# Swift 빌드 산출물 — 로컬 빌드라 커밋하지 않는다
+.build/
+ReviewBar.app/
+.swiftpm/
+Package.resolved
