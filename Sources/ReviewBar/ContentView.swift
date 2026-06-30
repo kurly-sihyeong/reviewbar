@@ -6,7 +6,8 @@ struct ContentView: View {
     @Environment(\.openURL) private var openURL
     @State private var contentHeight: CGFloat = 0
 
-    private let maxListHeight: CGFloat = 600
+    // 평소엔 600pt에서 스크롤. 스크린샷 모드에선 상한을 풀어 전체를 펼친다(스크롤 없는 데모 화면).
+    private var maxListHeight: CGFloat { model.isScreenshotMode ? 4000 : 600 }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -18,6 +19,11 @@ struct ContentView: View {
             footerBar
         }
         .frame(width: 400)   // 가로만 고정, 세로는 컨텐츠에 맞춰 동적
+        .background {
+            // 스크린샷 모드 전용 글래스 백드롭. 실제 앱은 MenuBarExtra의 시스템 백드롭을 쓰며,
+            // 여기에 NSVisualEffectView를 더하면 중첩되어 더 불투명해지므로 적용하지 않는다.
+            if model.isScreenshotMode { PopoverBackdrop() }
+        }
         .background(WindowAccessor { window in   // 메뉴 열 때마다 새로고침 관찰
             model.attachWindow(window)
         })
@@ -40,14 +46,16 @@ struct ContentView: View {
                 GlassEffectContainer(spacing: 12) {
                     VStack(spacing: 12) {
                         GroupCard(title: "리뷰할 PR", subtitle: "다른 사람", systemImage: "tray.and.arrow.down",
-                                  total: model.reviewPending.count + model.reviewApproved.count) {
+                                  total: model.reviewPending.count + model.reviewApproved.count,
+                                  emphasized: model.isScreenshotMode) {
                             SubSection(title: "미승인", systemImage: "clock", tint: .orange,
                                        prs: model.reviewPending, showAuthor: true)
                             SubSection(title: "승인됨", systemImage: "checkmark.seal.fill", tint: .green,
                                        prs: model.reviewApproved, showAuthor: true)
                         }
                         GroupCard(title: "내 PR", subtitle: "내가 작성", systemImage: "person.crop.circle",
-                                  total: model.minePending.count + model.mineApproved.count) {
+                                  total: model.minePending.count + model.mineApproved.count,
+                                  emphasized: model.isScreenshotMode) {
                             SubSection(title: "리뷰 전", systemImage: "pencil.circle", tint: .orange,
                                        prs: model.minePending, showAuthor: false)
                             SubSection(title: "리뷰 완료", systemImage: "paperplane.fill", tint: .green,
@@ -58,6 +66,7 @@ struct ContentView: View {
                 .padding(12)
                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
             }
+            .scrollIndicators(.hidden)   // 좁은 팝오버라 스크롤바 숨김(트랙패드/휠 스크롤은 유지)
             .frame(height: min(max(contentHeight, 1), maxListHeight))
         }
     }
@@ -134,6 +143,7 @@ struct GroupCard<Content: View>: View {
     let subtitle: String
     let systemImage: String
     let total: Int
+    var emphasized = false   // 스크린샷 모드: 불투명 배경에서 카드가 구분되게 그림자 강조
     @ViewBuilder var content: Content
 
     var body: some View {
@@ -149,7 +159,7 @@ struct GroupCard<Content: View>: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .cardGlass(cornerRadius: 14)
+        .cardGlass(cornerRadius: 14, emphasized: emphasized)
     }
 }
 
@@ -195,14 +205,10 @@ struct PRRow: View {
         HStack(alignment: .top, spacing: 8) {
             Circle().fill(tint).frame(width: 6, height: 6).padding(.top, 6)
 
-            AsyncImage(url: URL(string: pr.author?.avatarUrl ?? "")) { image in
-                image.resizable()
-            } placeholder: {
-                Color.secondary.opacity(0.2)
-            }
-            .frame(width: 18, height: 18)
-            .clipShape(Circle())
-            .padding(.top, 1)
+            AvatarView(urlString: pr.author?.avatarUrl ?? "")
+                .frame(width: 18, height: 18)
+                .clipShape(Circle())
+                .padding(.top, 1)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(pr.title)
@@ -258,4 +264,44 @@ struct CountPill: View {
             .background(Color.secondary.opacity(0.15), in: Capsule())
             .foregroundStyle(.secondary)
     }
+}
+
+// MARK: - 아바타 (명시적 .task 로더)
+
+/// `AsyncImage`가 NSHostingController 컨텍스트에서 로드 task를 안 거는 경우가 있어,
+/// `.task`로 직접 URLSession 다운로드해 표시한다. 로드 전/실패 시 회색 원.
+struct AvatarView: View {
+    let urlString: String
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image).resizable()
+            } else {
+                Color.secondary.opacity(0.2)
+            }
+        }
+        .task(id: urlString) {
+            guard let url = URL(string: urlString) else { return }
+            guard let (data, _) = try? await URLSession.shared.data(from: url),
+                  let img = NSImage(data: data) else { return }
+            image = img
+        }
+    }
+}
+
+// MARK: - 스크린샷용 글래스 백드롭
+
+/// 실제 메뉴바 팝오버의 시스템 글래스 백드롭을 재현하는 NSVisualEffectView.
+/// `.menu` 머티리얼 + `behindWindow`로 뒤 콘텐츠를 블러한 반투명 배경을 만든다(스크린샷 모드 전용).
+struct PopoverBackdrop: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .menu
+        view.blendingMode = .behindWindow
+        view.state = .active
+        return view
+    }
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }

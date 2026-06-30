@@ -29,8 +29,11 @@ final class AppModel {
     /// 첫 refresh로 기준선을 잡았는지. 잡기 전엔 알림하지 않는다(앱 시작 시 폭탄 방지).
     private var hasBaseline = false
 
+    /// 스크린샷 모드(`--screenshot`): 폴링·새로고침을 막아 주입된 mock 데이터를 그대로 유지한다.
+    var isScreenshotMode = false
+
     func start() {
-        guard !started else { return }
+        guard !isScreenshotMode, !started else { return }
         started = true
         Task {
             await notifier.requestAuthorization()
@@ -56,6 +59,7 @@ final class AppModel {
     /// - Parameter notify: 직전 기준선 대비 새로 들어온 리뷰 요청 PR을 데스크톱 알림으로 띄울지.
     ///   백그라운드 폴링은 `true`, 사용자가 메뉴를 직접 열거나 새로고침을 누른 경우는 `false`.
     func refresh(notify: Bool = false) async {
+        guard !isScreenshotMode else { return }   // mock 데이터 유지(네트워크 호출 안 함)
         guard !isLoading else { return }   // 동시/중복 호출 방지(열 때마다 1회만)
         isLoading = true
         defer { isLoading = false }
