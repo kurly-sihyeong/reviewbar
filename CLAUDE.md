@@ -23,8 +23,8 @@ pkill -x ReviewBar; open ./ReviewBar.app
 
 | 파일 | 역할 |
 |---|---|
-| `ReviewBarApp.swift` | `@main`. `MenuBarExtra(.window)` + 메뉴바 배지. **`App.init`에서 `model.start()` 호출**(중요, 아래) |
-| `ContentView.swift` | 팝오버 UI — 글래스 카드 2개·SF Symbol 헤더·PR 행(아바타/라벨 칩/상대시간)·동적 높이 |
+| `ReviewBarApp.swift` | `@main`. `MenuBarExtra(.window)` + 메뉴바 배지. **`App.init`에서 `model.start()` 호출**. `--screenshot`이면 mock 주입 |
+| `ContentView.swift` | 팝오버 UI — 글래스 카드 2개·SF Symbol 헤더·PR 행·동적 높이. 아바타 `AvatarView`(.task), 스크린샷용 `PopoverBackdrop` 포함 |
 | `AppModel.swift` | `@Observable @MainActor` 상태 + 백그라운드 폴링 + 새 PR diff·알림 트리거. `reviewDecision`으로 4분류 |
 | `Notifier.swift` | `UserNotifications` 래퍼(권한·배너·클릭 시 URL 열기) + osascript fallback |
 | `GitHubClient.swift` | `actor`. `gh auth token` + `URLSession`로 **GraphQL 단일 요청**(리뷰할+내 PR) |
@@ -36,6 +36,9 @@ pkill -x ReviewBar; open ./ReviewBar.app
 | `MenuBarIcon.swift` | 메뉴바 GitHub 마크(template) 로더 |
 | `build.sh` | release 빌드 → `.app` 번들 + `icon_gen.swift`로 아이콘 생성 + ad-hoc 서명 |
 | `icon_gen.swift` | `github-mark.png` 기반 앱/알림 아이콘 드로잉(다크 그라데이션 + 흰 Octocat + 초록 체크 배지) |
+| `AppDelegate.swift` | **스크린샷 모드 전용** — mock UI를 별도 윈도우로 띄워 캡처(평소엔 미동작) |
+| `MockData.swift` | 스크린샷용 가짜 PR 데이터(4분류) |
+| `screenshot.sh` | `--screenshot` 실행 → `screencapture` → `screenshots/popover.png` |
 
 ## ⚙️ 핵심 동작 (반드시 알아둘 것)
 
@@ -59,6 +62,18 @@ pkill -x ReviewBar; open ./ReviewBar.app
   `killall usernoted NotificationCenter`(sudo 불필요)로 갱신, 그래도 안 되면 **재로그인/재부팅**이 확실.
 - **알림 검증은 `open ./ReviewBar.app`(LaunchServices 경유)으로 실행.** 바이너리 직접 실행은 발신 번들 연결이 약하다.
   `open`은 환경변수를 못 넘기므로 플래그 주입이 필요하면 `launchctl setenv KEY 1` 후 `open`(끝나면 `launchctl unsetenv`).
+
+## 📸 스크린샷 모드 (README 이미지 생성)
+
+`./screenshot.sh` → mock 데이터로 팝오버를 캡처해 `screenshots/popover.png` 생성(실제 계정·네트워크 무관, 항상 동일).
+
+- `--screenshot` 시 `AppModel.isScreenshotMode=true`(폴링·네트워크 차단) + `MockData` 주입. App body의 `MenuBarExtra`는
+  `SceneBuilder`가 if/else를 못 받아, 별도 윈도우는 `AppDelegate`가 띄운다(borderless·11pt 모서리·key 윈도우라 버튼 활성).
+- `AppDelegate`가 윈도우 뒤에 고정 그라데이션 배경을 깔아, `PopoverBackdrop`(behindWindow 글래스)이 캡처마다 일관되게 풍부하다(없으면 데스크톱에 의존해 밋밋).
+- 스크린샷 연출(글래스 백드롭·전체 펼침·카드 그림자)은 **`model.isScreenshotMode` 분기로 스크린샷 때만** 적용한다.
+  **실제 앱엔 안 넣는다** — MenuBarExtra 시스템 백드롭과 중첩돼 더 불투명해짐(검증함).
+- **`AvatarView`(.task)**: `AsyncImage`가 NSHostingController 컨텍스트에서 로드 task를 안 걸어 아바타가 회색으로 남던 문제를
+  `.task` 직접 로드로 해결. 스크린샷뿐 아니라 **실제 앱 아바타에도 적용**된다.
 
 ## 의존성 / 인증
 
